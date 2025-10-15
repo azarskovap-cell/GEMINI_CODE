@@ -1,0 +1,282 @@
+import os
+import asyncio
+import base64  # Добавлен для кодирования файлов в base64
+from telegram import BotCommandScopeAllPrivateChats
+from io import BytesIO
+from dotenv import load_dotenv
+
+import aiohttp
+import requests
+from telegram import Update, BotCommand
+from telegram.ext import (
+    ApplicationBuilder, CommandHandler,
+    MessageHandler, ContextTypes, filters
+)
+    
+# === Настройки окружения ===
+load_dotenv()
+
+# Применяем .strip() для удаления лишних пробелов или символов новой строки
+TOKEN = os.getenv("TELEGRAM_TOKEN")
+GAS_PROXY_URL = os.getenv("GAS_PROXY_URL")
+
+# Apply strip if the value is not None
+TOKEN = TOKEN.strip() if TOKEN else None
+GAS_PROXY_URL = GAS_PROXY_URL.strip() if GAS_PROXY_URL else None
+
+# Проверка обязательных переменных
+if not TOKEN or not GAS_PROXY_URL:
+    print("Ошибка: Убедитесь, что TELEGRAM_TOKEN и GAS_PROXY_URL установлены в файле .env")
+    exit(1)
+
+
+# === Gemini-прокси ===
+async def query_gemini(prompt: str, file_data: str = None, mime_type: str = None) -> str:
+    """Отправляет запрос к Gemini через прокси, опционально с файлом."""
+
+    # Базовые части (Системная инструкция и промпт пользователя)
+    contents_parts = [
+        {
+            "text": "Отвечай всегда на русском языке, если вопрос не содержит другого указания. Если есть прикрепленный файл, внимательно его проанализируй."},
+        {"text": prompt}
+    ]
+
+    # Добавляем файл, если он есть
+    if file_data and mime_type:
+        contents_parts.append({
+            "inlineData": {
+                "mimeType": mime_type,
+                "data": file_data
+            }
+        })
+
+    payload = {
+        "model": "gemini-2.0-flash",
+        "args": {
+            "contents": [{"parts": contents_parts}]
+        }
+    }
+
+    try:
+        async with aiohttp.ClientSession() as s:
+            # Увеличен таймаут для больших файлов (до 2 минут)
+            async with s.post(GAS_PROXY_URL, json=payload, timeout=120) as r:
+                r.raise_for_status()  # Вызывает исключение для кодов 4xx/5xx
+                data = await r.json()
+
+                # Безопасное извлечение текста
+                text = (
+                    data.get("candidates", [{}])[0]
+                    .get("content", {})
+                    .get("parts", [{}])[0]
+                    .get("text", "")
+                )
+                return text or data.get("error", "Нет текста в ответе.")
+    except aiohttp.ClientError as e:
+        return f"Ошибка сетевого запроса к прокси: {e}"
+    except Exception as e:
+        return f"Общая ошибка при запросе к Gemini: {e}"
+
+
+# === Утилита для загрузки файла и кодирования в Base64 ===
+async def _download_file_as_base64(context: ContextTypes.DEFAULT_TYPE, file_id: str) -> bytes:
+    """Загружает файл из Telegram и возвращает его содержимое в Base64."""
+    try:
+        # Получаем объект файла из Telegram. Он содержит file_path (полный URL для скачивания).
+        file_obj = await context.bot.get_file(file_id)
+
+        # --- Используем aiohttp для прямого скачивания по URL ---
+        download_url = file_obj.file_path
+
+        if not download_url:
+            raise ValueError("Не удалось получить URL для скачивания файла.")
+
+        # Асинхронно скачиваем файл
+        async with aiohttp.ClientSession() as s:
+            async with s.get(download_url) as r:
+                r.raise_for_status()  # Проверка на ошибки HTTP (4xx/5xx)
+                file_bytes = await r.read()
+        # ------------------------------------------------------------------------
+
+        # Конвертируем байты в строку Base64
+        return base64.b64encode(file_bytes).decode('utf-8')
+    except Exception as e:
+        # Пробрасываем подробную ошибку, чтобы она отображалась в боте
+        raise Exception(f"Ошибка при загрузке или кодировании файла: {e}")
+
+
+# === Команда /start ===
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Отправляет приветственное сообщение."""
+    await update.message.reply_text(
+        "👋 Привет! Я — Gemini Proxy Bot, сфокусированный на анализе текста и файлов.\n"
+        "Задавай вопросы или прикрепи фото/документ (PDF, TXT) с вопросом для анализа!"
+    )
+
+
+# === Команда /help ===
+async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Отправляет список команд."""
+    await update.message.reply_text(
+        "📘 Команды:\n"
+        "/start — начать\n"
+        "/help — список команд\n\n"
+        "💬 В группе используй @, чтобы бот ответил.\n"
+        "🖼️ Анализ: Отправьте фото или документ (PDF, TXT) с подписью-вопросом для анализа."
+    )
+
+
+# === Обработка обычных сообщений ===
+async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обрабатывает текстовые сообщения и запросы в чатах/группах."""
+    if not update.message or not update.message.text:
+        return
+
+    bot_username = (await context.bot.get_me()).username.lower()
+    text = update.message.text
+
+    # В группе отвечаем только по упоминанию
+    if update.message.chat.type in ("group", "supergroup"):
+        if f"@{bot_username}" not in text.lower():
+            return
+        text = text.replace(f"@{bot_username}", "").strip()
+
+    if not text:
+        return  # Игнорируем пустое сообщение после удаления упоминания
+
+    # Отправляем индикатор набора текста
+    await update.message.chat.send_action(action="TYPING")
+
+    # Отправляем сообщение "Думаю..." и получаем объект сообщения для дальнейшего редактирования
+    status_message = await update.message.reply_text("⌛ Думаю...")
+
+    # Используем query_gemini без аргументов файла
+    answer = await query_gemini(text)
+
+    # Редактируем сообщение статуса, чтобы показать ответ
+    try:
+        await status_message.edit_text(answer)
+    except Exception:
+        # Если сообщение слишком длинное или не удалось отредактировать, отправляем новое сообщение
+        for chunk in [answer[i:i + 4000] for i in range(0, len(answer), 4000)]:
+            await update.message.reply_text(chunk)
+
+
+# === Обработчик файлов (Фото и Документы) ===
+async def handle_files(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обрабатывает фото, документы и их подписи с помощью Gemini."""
+    if not update.message:
+        return
+
+    file_id = None
+    mime_type = None
+
+    # 1. Определяем файл, его ID и MIME тип
+    if update.message.photo:
+        # Для фото выбираем самый большой размер
+        largest_photo = update.message.photo[-1]
+        file_id = largest_photo.file_id
+        # Telegram часто использует image/jpeg для загруженных фото
+        mime_type = "image/jpeg"
+    elif update.message.document:
+        document = update.message.document
+
+        # Полный список официально поддерживаемых MIME-типов для анализа Gemini:
+        supported_mimes = [
+            "image/jpeg",
+            "image/png",
+            "application/pdf",
+            "text/plain",  # Обычный текст (.txt)
+        ]
+
+        file_mime = document.mime_type
+
+        if file_mime in supported_mimes:
+            file_id = document.file_id
+            mime_type = file_mime
+        else:
+            await update.message.reply_text(
+                f"Извините, я не могу обработать файл типа: `{document.mime_type}`. "
+                f"Поддерживаются только изображения, PDF и TXT.\n\n"
+                f"💡 Совет: Для надежного анализа DOCX или других сложных документов, пожалуйста, **конвертируйте их в PDF** перед отправкой."
+            )
+            return
+    else:
+        return  # Игнорируем, если нет ни фото, ни документа
+
+    # 2. Получаем текст: это либо подпись, либо, если подписи нет, ставим запрос по умолчанию
+    user_prompt = update.message.caption or update.message.text
+    if not user_prompt:
+        user_prompt = "Опиши этот файл и ответь, что на нём изображено, или что в нём содержится."
+
+    # 3. Начинаем процесс
+    await update.message.chat.send_action(action="TYPING")
+    status_message = await update.message.reply_text(f"1️⃣ Загружаю и анализирую ваш файл ({mime_type})...")
+
+    try:
+        # 4. Загрузка файла и кодирование в base64
+        base64_data = await _download_file_as_base64(context, file_id)
+
+        # 5. Анализ Gemini
+        await status_message.edit_text("2️⃣ Анализирую файл с помощью Gemini...")
+
+        # Используем query_gemini с данными файла
+        answer = await query_gemini(user_prompt, base64_data, mime_type)
+
+        # 6. Ответ
+        await status_message.edit_text(answer)
+
+    except Exception as e:
+        # Общая обработка ошибок
+        error_msg = f"❌ Произошла ошибка при обработке файла. Подробнее: {str(e)}"
+        print(f"File handling error: {e}")
+        try:
+            await status_message.edit_text(error_msg)
+        except Exception:
+            await update.message.reply_text(error_msg)
+
+
+# === Устанавливаем список команд ===
+async def set_bot_commands(app):
+    """Устанавливает подсказки для команд в меню бота."""
+    commands = [
+        BotCommand("start", "Начать работу с ботом"),
+        BotCommand("help", "Показать список команд"),
+    ]
+
+    await app.bot.set_my_commands(
+        commands,
+        scope=BotCommandScopeAllPrivateChats()
+    )
+
+
+# === Запуск ===
+def main():
+    """Основная функция запуска бота."""
+    # Устанавливаем более долгий таймаут чтения (read_timeout) для HTTPX (по умолчанию 5 секунд),
+    # чтобы предотвратить NetworkError при нестабильном соединении с API Telegram.
+    app = ApplicationBuilder().token(TOKEN).concurrent_updates(True).read_timeout(15).build()
+
+    # === Регистрация обработчиков ===
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("help", help_command))
+
+    # Обработчик для фотографий и документов (например, PDF, TXT)
+    file_handler = MessageHandler(
+        (filters.PHOTO | filters.Document.ALL) & (~filters.COMMAND),
+        handle_files
+    )
+    app.add_handler(file_handler)
+
+    # Обработчик для текстовых сообщений (должен идти после file_handler)
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
+
+    # Выполнение установки команд после инициализации бота
+    app.post_init = set_bot_commands
+
+    print("✅ Бот запущен. Работает в чатах и группах.")
+    app.run_polling()
+
+
+if __name__ == "__main__":
+    main()
